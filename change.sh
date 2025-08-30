@@ -1,68 +1,9 @@
 #!/bin/sh
 
+set -eu
+
 # Use %U:%G:%A:%Y if ctime is not supported
 : "${CHANGE_METADATA:="%Z"}"
-
-: "${CHANGE_FIND_NAME:=""}"
-: "${CHANGE_FIND_INAME:=""}"
-: "${CHANGE_FIND_PATH:=""}"
-: "${CHANGE_FIND_IPATH:=""}"
-: "${CHANGE_FIND_REGEX:=""}"
-: "${CHANGE_FIND_TYPE:=""}"
-: "${CHANGE_FIND_EXECUTABLE:="0"}"
-: "${CHANGE_FIND_PERM:=""}"
-: "${CHANGE_FIND_MTIME:=""}"
-: "${CHANGE_FIND_ATIME:=""}"
-: "${CHANGE_FIND_CTIME:=""}"
-: "${CHANGE_FIND_MMIN:=""}"
-: "${CHANGE_FIND_NEWER:=""}"
-: "${CHANGE_FIND_USER:=""}"
-: "${CHANGE_FIND_GROUP:=""}"
-: "${CHANGE_FIND_SIZE:=""}"
-: "${CHANGE_FIND_LINKS:=""}"
-: "${CHANGE_FIND_EMPTY:="0"}"
-: "${CHANGE_FIND_PRUNE:="0"}"
-
-while :; do
-  case "$1" in
-    -name) CHANGE_FIND_NAME=$2; shift 2 ;;
-    -name=*) CHANGE_FIND_NAME=${1#*=} ; shift ;;
-    -iname) CHANGE_FIND_INAME=$2; shift 2 ;;
-    -iname=*) CHANGE_FIND_INAME=${1#*=} ; shift ;;
-    -path) CHANGE_FIND_PATH=$2; shift 2 ;;
-    -path=*) CHANGE_FIND_PATH=${1#*=}; shift ;;
-    -ipath) CHANGE_FIND_IPATH=$2; shift 2 ;;
-    -ipath=*) CHANGE_FIND_IPATH=${1#*=} ; shift ;;
-    -regex) CHANGE_FIND_REGEX=$2; shift 2 ;;
-    -regex=*) CHANGE_FIND_REGEX=${1#*=} ; shift ;;
-    -type) CHANGE_FIND_TYPE=$2; shift 2 ;;
-    -type=*) CHANGE_FIND_TYPE=${1#*=} ; shift ;;
-    -executable) CHANGE_FIND_EXECUTABLE=1; shift ;;
-    -perm) CHANGE_FIND_PERM=$2; shift 2 ;;
-    -perm=*) CHANGE_FIND_PERM=${1#*=} ; shift ;;
-    -mtime) CHANGE_FIND_MTIME=$2; shift 2 ;;
-    -mtime=*) CHANGE_FIND_MTIME=${1#*=} ; shift ;;
-    -atime) CHANGE_FIND_ATIME=$2; shift 2 ;;
-    -atime=*) CHANGE_FIND_ATIME=${1#*=} ; shift ;;
-    -ctime) CHANGE_FIND_CTIME=$2; shift 2 ;;
-    -ctime=*) CHANGE_FIND_CTIME=${1#*=} ; shift ;;
-    -mmin) CHANGE_FIND_MMIN=$2; shift 2 ;;
-    -mmin=*) CHANGE_FIND_MMIN=${1#*=} ; shift ;;
-    -newer) CHANGE_FIND_NEWER=$2; shift 2 ;;
-    -newer=*) CHANGE_FIND_NEWER=${1#*=} ; shift ;;
-    -user) CHANGE_FIND_USER=$2; shift 2 ;;
-    -user=*) CHANGE_FIND_USER=${1#*=} ; shift ;;
-    -group) CHANGE_FIND_GROUP=$2; shift 2 ;;
-    -group=*) CHANGE_FIND_GROUP=${1#*=} ; shift ;;
-    -size) CHANGE_FIND_SIZE=$2; shift 2 ;;
-    -size=*) CHANGE_FIND_SIZE=${1#*=} ; shift ;;
-    -links) CHANGE_FIND_LINKS=$2; shift 2 ;;
-    -links=*) CHANGE_FIND_LINKS=${1#*=} ; shift ;;
-    -empty) CHANGE_FIND_EMPTY=1; shift ;;
-    -prune) CHANGE_FIND_PRUNE=1; shift ;;
-    *) break ;;
-  esac
-done
 
 ctime_support() {
   if [ -f "$1" ]; then
@@ -80,14 +21,114 @@ ctime_support() {
   [ "$_before" != "$_after" ]
 }
 
-summary() {
-  find -L "$1" -exec stat -L -c "%n:%s:%F:${CHANGE_METADATA}" {} \;
+check_find_args() {
+  if [ "$#" -eq 0 ]; then
+    return
+  fi
+
+  # Verify first argument looks like a find option
+  case "$1" in
+    -*)
+      ;;
+    "(")
+      ;;
+    "!")
+      ;;
+    *)
+      echo "Invalid find option: $1" >&2
+      exit 1
+      ;;
+  esac
+
+  # Verify find options
+  for opt; do
+    case "$opt" in
+      -print*|-exec|-ok|-delete|-quit)
+        echo "$opt is not allowed as a find action" >&2
+        exit 1
+        ;;
+    esac
+  done
 }
 
-for dir; do
-  if [ ! -d "$dir" ]; then
-    echo "Not a directory: $dir" >&2
+idempotent_ls() {
+  # Pickup path the directory, scream on error
+  _dir=$1
+  if ! [ -d "$_dir" ]; then
+    echo "Not a directory: $_dir" >&2
     exit 1
   fi
-  summary "$dir" | sha256sum | awk '{print $1}'
-done
+  shift
+
+  check_find_args "$@"
+
+  # Generate a unique file list, recursively.
+  find -L "$_dir" "$@" -exec stat -L -c "%n:%s:%F:${CHANGE_METADATA}" {} \; | sort
+}
+
+generate_dirsum() {
+  sumbin=$1
+  shift
+  idempotent_ls "$@" | "$sumbin" | awk '{print $1}'
+}
+
+generate_sums() {
+  sumbin=$1
+  paths=$2
+  shift 2
+  if [ -z "$paths" ] || [ "$paths" = "-" ]; then
+    while IFS= read -r path; do
+      generate_dirsum "$sumbin" "$path" "$@"
+    done
+  elif [ -f "$paths" ]; then
+    while IFS= read -r path; do
+      generate_dirsum "$sumbin" "$path" "$@"
+    done <"$paths"
+  elif [ -d "$paths" ]; then
+    generate_dirsum "$sumbin" "$paths" "$@"
+  else
+    echo "$2 is not a file, nor a dir!" >&2
+    exit 1
+  fi
+}
+
+main() {
+  case "$1" in
+    detect)
+      shift
+      for path; do
+        if ctime_support "$path"; then
+          CHANGE_METADATA="%Z"
+        else
+          CHANGE_METADATA="%U:%G:%A:%Y"
+        fi
+        printf "%s\n" "$CHANGE_METADATA"
+      done
+      ;;
+    sha256)
+      shift
+      generate_sums sha256sum "$@"
+      ;;
+    sha512)
+      shift
+      generate_sums sha512sum "$@"
+      ;;
+    *)
+      echo "Invalid command: $1" >&2
+      exit 1
+      ;;
+  esac
+}
+
+if [ "$#" -eq 0 ]; then
+  generate_dirsum sha256sum .
+  exit
+fi
+
+if [ "$#" -gt 0 ]; then
+  if [ -d "$1" ] || [ -f "$1" ] || [ "$1" = "-" ]; then
+    generate_sums sha256sum "$@"
+  else
+    main "$@"
+  fi
+fi
